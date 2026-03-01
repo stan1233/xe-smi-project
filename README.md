@@ -88,7 +88,7 @@ If you're running an Intel Arc Pro B50 (or other Battlemage GPU) passed through 
 
 ```bash
 # Clone the repo
-git clone https://github.com/YOUR_USERNAME/xe-smi.git
+git clone https://github.com/stan1233/xe-smi-project.git
 cd xe-smi
 
 # Install
@@ -98,7 +98,7 @@ sudo install -m 755 xe-smi /usr/local/bin/xe-smi
 Or one-liner:
 
 ```bash
-sudo curl -fsSL https://raw.githubusercontent.com/stan1233/xe-smi/main/xe-smi -o /usr/local/bin/xe-smi && sudo chmod +x /usr/local/bin/xe-smi
+sudo curl -fsSL https://raw.githubusercontent.com/stan1233/xe-smi-project/main/xe-smi -o /usr/local/bin/xe-smi && sudo chmod +x /usr/local/bin/xe-smi
 ```
 
 ## Usage
