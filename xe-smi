@@ -1,0 +1,345 @@
+#!/bin/bash
+# xe-smi — Intel Arc GPU monitor for SR-IOV VF mode
+# Default: live dynamic monitoring (like nvitop)
+# -s: static snapshot (like nvidia-smi)
+
+DRI_DEBUG="/sys/kernel/debug/dri/1"
+DRI_SYS="/sys/class/drm/card1/device"
+
+# Colors
+BOLD=$'\033[1m'
+DIM=$'\033[2m'
+CYAN=$'\033[36m'
+GREEN=$'\033[32m'
+YELLOW=$'\033[33m'
+RED=$'\033[31m'
+RESET=$'\033[0m'
+HOME_POS=$'\033[H'
+HIDE_CURSOR=$'\033[?25l'
+SHOW_CURSOR=$'\033[?25h'
+
+# ========== Data Functions ==========
+
+get_vram_info() {
+    local vram_data=$(cat "$DRI_DEBUG/vram0_mm" 2>/dev/null)
+    local total_bytes=$(echo "$vram_data" | grep "^  size:" | awk '{print $2}')
+    local used_bytes=$(echo "$vram_data" | grep "^  usage:" | awk '{print $2}')
+    if [ -n "$total_bytes" ] && [ -n "$used_bytes" ]; then
+        local total_mib=$((total_bytes / 1048576))
+        local used_mib=$((used_bytes / 1048576))
+        local free_mib=$((total_mib - used_mib))
+        local pct=0
+        [ "$total_mib" -gt 0 ] && pct=$((used_mib * 100 / total_mib))
+        echo "${used_mib}|${total_mib}|${free_mib}|${pct}"
+    else
+        echo "N/A|N/A|N/A|0"
+    fi
+}
+
+get_device_name() {
+    local devid=$(cat "$DRI_SYS/device" 2>/dev/null)
+    [ "$devid" = "0xe212" ] && echo "Intel Arc Pro B50 (Battlemage G21)" || echo "Intel GPU [$devid]"
+}
+
+get_sriov_mode() {
+    grep "^mode:" "$DRI_DEBUG/sriov_info" 2>/dev/null | awk '{print $2, $3}'
+}
+
+count_bits() {
+    local hex=$(echo "$1" | tr -d ',')
+    local bin=$(echo "obase=2;ibase=16;$(echo "$hex" | tr 'a-f' 'A-F')" | bc 2>/dev/null)
+    [ -n "$bin" ] && echo "$bin" | tr -cd '1' | wc -c || echo "?"
+}
+
+get_topology_info() {
+    local g0d=$(count_bits "$(grep 'dss mask (compute):' "$DRI_DEBUG/gt0/topology" 2>/dev/null | head -1 | awk '{print $NF}')")
+    local g0e=$(count_bits "$(grep 'EU mask per DSS:' "$DRI_DEBUG/gt0/topology" 2>/dev/null | head -1 | awk '{print $NF}')")
+    local g1d=$(count_bits "$(grep 'dss mask (compute):' "$DRI_DEBUG/gt1/topology" 2>/dev/null | head -1 | awk '{print $NF}')")
+    local g1e=$(count_bits "$(grep 'EU mask per DSS:' "$DRI_DEBUG/gt1/topology" 2>/dev/null | head -1 | awk '{print $NF}')")
+    local g0t="?" g1t="?"
+    [ "$g0d" != "?" ] && [ "$g0e" != "?" ] && g0t=$((g0d * g0e))
+    [ "$g1d" != "?" ] && [ "$g1e" != "?" ] && g1t=$((g1d * g1e))
+    echo "GT0: ${g0d}DSS×${g0e}EU=${g0t} | GT1: ${g1d}DSS×${g1e}EU=${g1t}"
+}
+
+get_engines() {
+    local engines=""
+    for gt_dir in "$DRI_SYS/tile0/gt0/engines" "$DRI_SYS/tile0/gt1/engines"; do
+        [ -d "$gt_dir" ] && for eng in "$gt_dir"/*/; do engines+="$(basename "$eng") "; done
+    done
+    echo "$engines"
+}
+
+get_gpu_processes() {
+    declare -A seen
+    for fd in /proc/[0-9]*/fdinfo/*; do
+        if grep -q "drm-driver: xe" "$fd" 2>/dev/null; then
+            local pid=$(echo "$fd" | cut -d'/' -f3)
+            if [ -z "${seen[$pid]}" ]; then
+                seen[$pid]=1
+                local cmd=$(cat /proc/$pid/comm 2>/dev/null)
+                local vram=$(grep "drm-memory-vram" "$fd" 2>/dev/null | awk '{print $2}')
+                local rss=$(awk '/VmRSS/{print $2}' /proc/$pid/status 2>/dev/null)
+                [ -n "$cmd" ] && echo "${pid}|${cmd}|${vram:-0}|${rss:-0}"
+            fi
+        fi
+    done 2>/dev/null
+}
+
+draw_bar() {
+    local pct=$1 width=$2
+    local filled=$((pct * width / 100))
+    [ "$filled" -gt "$width" ] && filled=$width
+    local empty=$((width - filled))
+    local color="$GREEN"
+    [ "$pct" -ge 60 ] && color="$YELLOW"
+    [ "$pct" -ge 85 ] && color="$RED"
+    echo -n "${color}"
+    for ((i=0; i<filled; i++)); do echo -n "█"; done
+    echo -n "${DIM}"
+    for ((i=0; i<empty; i++)); do echo -n "░"; done
+    echo -n "${RESET}"
+}
+
+print_hline() {
+    local w=${1:-74}
+    echo -n "${DIM}+"
+    for ((i=0; i<w; i++)); do echo -n "─"; done
+    echo "+${RESET}"
+}
+
+# ========== Static Mode (-s) ==========
+
+static_mode() {
+    local device_name=$(get_device_name)
+    local sriov_mode=$(get_sriov_mode)
+    local topo=$(get_topology_info)
+    local engines=$(get_engines)
+    IFS='|' read -r vram_used vram_total vram_free vram_pct <<< "$(get_vram_info)"
+
+    local w=74
+    echo ""
+    print_hline $w
+    echo " ${BOLD}${CYAN}xe-smi${RESET}  ${DIM}$(date '+%a %b %d %H:%M:%S %Y')${RESET}    ${DIM}Driver: xe (SR-IOV VF)${RESET}"
+    print_hline $w
+    echo " ${BOLD}GPU 0${RESET}: $device_name"
+    echo " ${DIM}Mode${RESET}: $sriov_mode    ${DIM}PCI${RESET}: 0000:00:10.0"
+    print_hline $w
+    echo -n " ${BOLD}VRAM${RESET}:  "
+    draw_bar "$vram_pct" 30
+    echo "  ${BOLD}${vram_used} MiB${RESET} / ${vram_total} MiB  (${vram_pct}%)"
+    echo " ${DIM}Free: ${vram_free} MiB${RESET}"
+    print_hline $w
+    echo " ${BOLD}Topology${RESET}: $topo"
+    echo " ${BOLD}Engines${RESET}:  $engines"
+    print_hline $w
+    echo " ${BOLD}GPU Processes${RESET}:"
+    local procs=$(get_gpu_processes)
+    if [ -z "$procs" ]; then
+        echo "  No GPU processes running"
+    else
+        printf "  ${DIM}%-8s %-20s %10s %10s${RESET}\n" "PID" "COMMAND" "VRAM(KB)" "RSS(KB)"
+        echo "$procs" | while IFS='|' read -r pid cmd vram rss; do
+            [ -z "$pid" ] && continue
+            printf "  ${GREEN}%-8s${RESET} %-20s %10s %10s\n" "$pid" "$cmd" "$vram" "$rss"
+        done
+    fi
+    print_hline $w
+    echo ""
+}
+
+# ========== Live Mode (default) ==========
+
+live_mode() {
+    local interval=${1:-1}
+    local device_name=$(get_device_name)
+    local sriov_mode=$(get_sriov_mode)
+    local topo=$(get_topology_info)
+    local engines=$(get_engines)
+
+    # VRAM history for sparkline graph
+    local -a vram_history=()
+    local graph_width=50
+    local graph_height=8
+
+    cleanup() {
+        echo -n "$SHOW_CURSOR"
+        tput rmcup 2>/dev/null
+        exit 0
+    }
+    trap cleanup EXIT INT TERM
+
+    tput smcup 2>/dev/null
+    echo -n "$HIDE_CURSOR"
+
+    local prev_gt0_tlb=0 prev_gt1_tlb=0
+    local prev_gt0_pf=0 prev_gt1_pf=0
+
+    while true; do
+        echo -n "$HOME_POS"
+
+        IFS='|' read -r vram_used vram_total vram_free vram_pct <<< "$(get_vram_info)"
+
+        vram_history+=("$vram_pct")
+        [ ${#vram_history[@]} -gt $graph_width ] && vram_history=("${vram_history[@]:1}")
+
+        local w=74
+        local now=$(date '+%H:%M:%S')
+
+        # ── Header ──
+        print_hline $w
+        echo " ${BOLD}${CYAN}xe-smi${RESET} ${BOLD}LIVE${RESET}  ${DIM}$now${RESET}  ${DIM}refresh: ${interval}s${RESET}            ${DIM}Ctrl+C to exit${RESET}"
+        print_hline $w
+
+        # ── Device ──
+        echo " ${BOLD}GPU 0${RESET}: $device_name                      "
+        echo " ${DIM}Mode${RESET}: $sriov_mode  ${DIM}PCI${RESET}: 0000:00:10.0  ${DIM}Topo${RESET}: $topo"
+        print_hline $w
+
+        # ── VRAM bar ──
+        echo -n " ${BOLD}VRAM${RESET}  "
+        draw_bar "$vram_pct" 35
+        local vram_color="$GREEN"
+        [ "$vram_pct" -ge 60 ] 2>/dev/null && vram_color="$YELLOW"
+        [ "$vram_pct" -ge 85 ] 2>/dev/null && vram_color="$RED"
+        echo "  ${vram_color}${BOLD}${vram_used}${RESET}/${vram_total} MiB (${vram_color}${BOLD}${vram_pct}%${RESET})   "
+        echo ""
+
+        # ── VRAM History Graph ──
+        echo " ${DIM}VRAM History:${RESET}                                                          "
+        local levels=("▁" "▂" "▃" "▄" "▅" "▆" "▇" "█")
+        for ((row=graph_height; row>=1; row--)); do
+            local threshold=$((row * 100 / graph_height))
+            if [ "$row" -eq "$graph_height" ]; then
+                printf " ${DIM}%3d%%${RESET}│" "100"
+            elif [ "$row" -eq 1 ]; then
+                printf " ${DIM}  0%%${RESET}│"
+            elif [ "$row" -eq $((graph_height / 2 + 1)) ]; then
+                printf " ${DIM} 50%%${RESET}│"
+            else
+                printf " ${DIM}    ${RESET}│"
+            fi
+
+            for ((col=0; col<graph_width; col++)); do
+                local idx=$((col - (graph_width - ${#vram_history[@]})))
+                if [ "$idx" -ge 0 ] && [ "$idx" -lt "${#vram_history[@]}" ]; then
+                    local val=${vram_history[$idx]}
+                    local val_row=$((val * graph_height / 100))
+                    if [ "$val_row" -ge "$row" ]; then
+                        local color="$GREEN"
+                        [ "$val" -ge 60 ] && color="$YELLOW"
+                        [ "$val" -ge 85 ] && color="$RED"
+                        echo -n "${color}█${RESET}"
+                    else
+                        echo -n " "
+                    fi
+                else
+                    echo -n " "
+                fi
+            done
+            echo "  "
+        done
+        echo -n " ${DIM}    └"
+        for ((i=0; i<graph_width; i++)); do echo -n "─"; done
+        echo "  ${RESET}"
+        printf " ${DIM}%$((graph_width + 2))s${RESET}\n" "now →"
+
+        print_hline $w
+
+        # ── Processes ──
+        echo " ${BOLD}Processes${RESET}:                                                            "
+        printf " ${DIM} %-7s %-18s %10s %10s${RESET}\n" "PID" "COMMAND" "VRAM(KB)" "RSS(KB)"
+
+        local procs=$(get_gpu_processes)
+        local proc_lines=0
+        if [ -n "$procs" ]; then
+            while IFS='|' read -r pid cmd vram rss; do
+                [ -z "$pid" ] && continue
+                local pc="$GREEN"
+                [ "${vram:-0}" -gt 100000 ] 2>/dev/null && pc="$YELLOW"
+                [ "${vram:-0}" -gt 500000 ] 2>/dev/null && pc="$RED"
+                printf " ${pc} %-7s${RESET} %-18s %10s %10s     \n" "$pid" "$cmd" "${vram:-0}" "${rss:-0}"
+                proc_lines=$((proc_lines + 1))
+            done <<< "$procs"
+        fi
+        if [ "$proc_lines" -eq 0 ]; then
+            echo " ${DIM} (no GPU processes)${RESET}                                                "
+        fi
+        # Clear extra old lines (up to 10)
+        for ((i=proc_lines; i<10; i++)); do
+            printf "%-76s\n" ""
+        done
+
+        print_hline $w
+
+        # ── Activity ──
+        local gt0_tlb=$(grep "^tlb_inval_count:" "$DRI_DEBUG/gt0/stats" 2>/dev/null | awk '{print $2}')
+        local gt1_tlb=$(grep "^tlb_inval_count:" "$DRI_DEBUG/gt1/stats" 2>/dev/null | awk '{print $2}')
+        local gt0_pf=$(grep "^vma_pagefault_count:" "$DRI_DEBUG/gt0/stats" 2>/dev/null | awk '{print $2}')
+        local gt1_pf=$(grep "^vma_pagefault_count:" "$DRI_DEBUG/gt1/stats" 2>/dev/null | awk '{print $2}')
+
+        local d_gt0_tlb=$(( ${gt0_tlb:-0} - prev_gt0_tlb ))
+        local d_gt1_tlb=$(( ${gt1_tlb:-0} - prev_gt1_tlb ))
+        local d_gt0_pf=$(( ${gt0_pf:-0} - prev_gt0_pf ))
+        local d_gt1_pf=$(( ${gt1_pf:-0} - prev_gt1_pf ))
+
+        prev_gt0_tlb=${gt0_tlb:-0}
+        prev_gt1_tlb=${gt1_tlb:-0}
+        prev_gt0_pf=${gt0_pf:-0}
+        prev_gt1_pf=${gt1_pf:-0}
+
+        local activity_color="$DIM"
+        [ $((d_gt0_tlb + d_gt1_tlb + d_gt0_pf + d_gt1_pf)) -gt 0 ] && activity_color="$YELLOW"
+
+        echo " ${BOLD}Activity${RESET} ${DIM}(delta/${interval}s)${RESET}:                                              "
+        echo " ${activity_color} GT0: TLB±${d_gt0_tlb} faults±${d_gt0_pf}  |  GT1: TLB±${d_gt1_tlb} faults±${d_gt1_pf}${RESET}                    "
+        echo " ${DIM} Engines: ${engines}${RESET}                                    "
+        print_hline $w
+
+        sleep "$interval"
+    done
+}
+
+# ========== Usage ==========
+
+usage() {
+    echo "xe-smi — Intel Arc GPU Monitor (SR-IOV VF)"
+    echo ""
+    echo "Usage: xe-smi [OPTIONS]"
+    echo ""
+    echo "Options:"
+    echo "  (default)     Live dynamic monitoring (like nvitop)"
+    echo "  -s            Static snapshot (like nvidia-smi)"
+    echo "  -i SECONDS    Refresh interval for live mode (default: 1)"
+    echo "  -h            Show this help"
+    echo ""
+    echo "Examples:"
+    echo "  sudo xe-smi           # Live monitoring"
+    echo "  sudo xe-smi -s        # One-time snapshot"
+    echo "  sudo xe-smi -i 2      # Live, refresh every 2s"
+}
+
+# ========== Main ==========
+
+MODE="live"
+INTERVAL=1
+
+while getopts "si:h" opt; do
+    case $opt in
+        s) MODE="static" ;;
+        i) INTERVAL="$OPTARG" ;;
+        h) usage; exit 0 ;;
+        *) usage; exit 1 ;;
+    esac
+done
+
+if [ ! -r "$DRI_DEBUG/vram0_mm" ]; then
+    echo "Error: Cannot read $DRI_DEBUG/vram0_mm"
+    echo "Run with: sudo xe-smi"
+    exit 1
+fi
+
+case "$MODE" in
+    static) static_mode ;;
+    live)   live_mode "$INTERVAL" ;;
+esac
