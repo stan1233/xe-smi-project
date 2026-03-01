@@ -98,7 +98,7 @@ sudo install -m 755 xe-smi /usr/local/bin/xe-smi
 Or one-liner:
 
 ```bash
-sudo curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/xe-smi/main/xe-smi -o /usr/local/bin/xe-smi && sudo chmod +x /usr/local/bin/xe-smi
+sudo curl -fsSL https://raw.githubusercontent.com/stan1233/xe-smi/main/xe-smi -o /usr/local/bin/xe-smi && sudo chmod +x /usr/local/bin/xe-smi
 ```
 
 ## Usage
